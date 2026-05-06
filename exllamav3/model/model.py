@@ -226,6 +226,7 @@ class Model(Model_TPMixin, Model_LSMixin):
         verbose: bool = False,
         max_batch_size: int = 1,
         tp_options: dict | None = None,
+        equal_split_proportions: list[int] | None = None,
     ):
         """
         Load model, generator function. For regular function, call load() with the same arguments
@@ -349,24 +350,48 @@ class Model(Model_TPMixin, Model_LSMixin):
                 while len(reserve_per_device) < num_devices:
                     reserve_per_device.append(0.5)
                 reserve_per_device = [int(x * 1024**3) for x in reserve_per_device]
+            # Identify active devices based on proportions or defaults
+            if equal_split_proportions is not None:
+                active_devices = [i for i, p in enumerate(equal_split_proportions) if p > 0]
+            elif upd:
+                active_devices = [i for i, x in enumerate(use_per_device) if x > 0]
+            else:
                 active_devices = [
                     i for i in range(num_devices)
                     if i >= len(reserve_per_device) or reserve_per_device[i] >= 0
                 ]
 
-            if upd:
-                if any(isinstance(use_per_device, t) for t in [float, int]):
-                    use_per_device = [use_per_device] * num_devices
-                elif not isinstance(use_per_device, list):
-                    raise ValueError("use_per_device must be float or list[float]")
-                use_per_device = [int(x * 1024**3) for x in use_per_device]
-                active_devices = [
-                    i for i, x in enumerate(use_per_device)
-                    if x > 0
-                ]
-
             # Split load
             if not tensor_p:
+                # Pre-calculate equal distribution if proportions are provided
+                device_map = None
+                if equal_split_proportions is not None:
+                    from .model_equal_split import compute_equal_device_map
+
+                    # Retrieve the cache object from weakrefs (must be constructed before load)
+                    cache = None
+                    cl = [m for m in self if m.caps.get("kv_cache")]
+                    if cl and len(cl[0].cache_layers) > 0:
+                        c0 = cl[0].cache_layers[0]
+                        cache = self.cache_weakrefs[c0.cache_id]()
+
+                    device_map, report = compute_equal_device_map(
+                        model=self,
+                        cache=cache,
+                        proportions=equal_split_proportions,
+                        max_chunk_size=max_chunk_size,
+                        max_output_size=max_output_size,
+                        max_output_factor=max_output_factor,
+                    )
+                    print("=== Equal Autosplit ===", flush=True)
+                    for line in report:
+                        print(line, flush=True)
+                    # Override active_devices to match the GPUs actually used
+                    active_devices = [
+                        i for i, p in enumerate(equal_split_proportions)
+                        if p > 0
+                    ]
+
                 yield from self._load_autosplit(
                     progressbar,
                     reserve_per_device,
@@ -381,7 +406,8 @@ class Model(Model_TPMixin, Model_LSMixin):
                     self.modules,
                     verbose,
                     max_batch_size,
-                    self.cache_weakrefs
+                    self.cache_weakrefs,
+                    device_map,
                 )
                 self.output_device = self.modules[-1].device
 

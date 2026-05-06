@@ -33,30 +33,30 @@ class DFlashConfig(Config):
         )
 
         # Attention params
-        self.head_dim = self.read_cfg(int, "head_dim", None)
-        self.hidden_size = self.read_cfg(int, "hidden_size", no_default)
-        self.num_q_heads = self.read_cfg(int, "num_attention_heads", no_default)
-        self.num_kv_heads = self.read_cfg(int, "num_key_value_heads", self.num_q_heads)
+        self.head_dim = self.read_cfg(int, ["head_dim", "transformer_layer_config->head_dim"], None)
+        self.hidden_size = self.read_cfg(int, ["hidden_size", "transformer_layer_config->hidden_size"], no_default)
+        self.num_q_heads = self.read_cfg(int, ["num_attention_heads", "transformer_layer_config->num_attention_heads"], no_default)
+        self.num_kv_heads = self.read_cfg(int, ["num_key_value_heads", "transformer_layer_config->num_key_value_heads"], self.num_q_heads)
 
         if not self.head_dim:
             self.head_dim = self.hidden_size // self.num_q_heads
 
         # MLP params
-        self.assert_cfg(str, "hidden_act", "silu", True)
-        self.intermediate_size = self.read_cfg(int, "intermediate_size", no_default)
+        self.assert_cfg(str, ["hidden_act", "transformer_layer_config->hidden_act"], "silu", True)
+        self.intermediate_size = self.read_cfg(int, ["intermediate_size", "transformer_layer_config->intermediate_size"], no_default)
 
         # Norms
-        self.rms_norm_eps = self.read_cfg(float, "rms_norm_eps", no_default)
+        self.rms_norm_eps = self.read_cfg(float, ["rms_norm_eps", "transformer_layer_config->rms_norm_eps"], no_default)
 
         # Layers
-        self.num_hidden_layers = self.read_cfg(int, "num_hidden_layers", no_default)
+        self.num_hidden_layers = self.read_cfg(int, ["num_hidden_layers", "transformer_layer_config->num_hidden_layers"], no_default)
         # self.num_target_layers = self.read_cfg(int, "num_target_layers", no_default)
         self.layer_types = self.read_cfg(list, "layer_types", ["full_attention"] * self.num_hidden_layers)
         self.sliding_window = self.read_cfg(int, "sliding_window", 2048)
 
         # DFlash
-        self.mask_token_id = self.read_cfg(int, "dflash_config->mask_token_id", no_default)
-        self.target_layer_ids = self.read_cfg(list, "dflash_config->target_layer_ids", no_default)
+        self.mask_token_id = self.read_cfg(int, ["dflash_config->mask_token_id", "mask_token_id"], no_default)
+        self.target_layer_ids = self.read_cfg(list, ["dflash_config->target_layer_ids", "aux_hidden_state_layer_ids"], no_default)
         self.block_size = self.read_cfg(int, "block_size", no_default)
 
         # RoPE

@@ -68,7 +68,8 @@ class Model_LSMixin(ABC):
         modules: list,
         verbose: bool,
         max_batch_size: int,
-        cache_weakrefs: dict
+        cache_weakrefs: dict,
+        device_map: dict[int, int | str] | None = None,
     ):
         current_device_i = 0
         backup_shape, backup_dtype = self.default_load_shape_dtype(max_chunk_size)
@@ -95,9 +96,7 @@ class Model_LSMixin(ABC):
                     prepare_for_recurrence(None, params, self)
 
         with ProgressBar(f"Loading (LS)" if progressbar else None, len(modules)) as progress:
-
             for idx, module in enumerate(modules):
-
                 if callback_sync: callback_sync(idx, len(modules))
                 if generator: yield idx, len(modules)
 
@@ -111,18 +110,31 @@ class Model_LSMixin(ABC):
 
                 while True:
                     try:
-                        # Select device
-                        load_device = torch.device("cpu") if module.caps.get("prefer_cpu") else \
-                            torch.device(active_devices[current_device_i])
-                        x_device = torch.device("cpu") if module.caps.get("prefer_cpu") or module.caps.get("x_cpu") else \
-                            torch.device(active_devices[current_device_i])
+                        # Select device — forced from device_map or original sequential logic
+                        if device_map is not None and idx in device_map:
+                            assigned_dev = device_map[idx]
+                            if assigned_dev == 'cpu':
+                                load_device = torch.device("cpu")
+                            else:
+                                load_device = torch.device(assigned_dev)
+                                # Update current_device_i to match
+                                if assigned_dev in active_devices:
+                                    current_device_i = active_devices.index(assigned_dev)
+                        else:
+                            load_device = torch.device("cpu") if module.caps.get("prefer_cpu") else \
+                                torch.device(active_devices[current_device_i])
 
-                        # Set VRAM limit if new device
-                        if load_device != torch.device("cpu") and load_device != prev_load_device:
+                        # Ensure x_device (input/state device) matches load_device unless CPU is explicitly preferred
+                        if module.caps.get("prefer_cpu") or module.caps.get("x_cpu"):
+                            x_device = torch.device("cpu")
+                        else:
+                            x_device = load_device
+
+                        # Set VRAM limit if new device — skip when device_map is active
+                        if device_map is None and load_device != torch.device("cpu") and load_device != prev_load_device:
                             prev_load_device = load_device
                             i = active_devices[current_device_i]
                             touched_devices.append(i)
-                            i = active_devices[current_device_i]
                             if reserve_per_device is not None:
                                 set_memory_fraction_reserve(reserve_per_device[i], i)
                             elif use_per_device is not None:
@@ -130,14 +142,13 @@ class Model_LSMixin(ABC):
                             else:
                                 raise RuntimeError("Logic error")
 
-                        # (Re)create or backup hidden state (metadata)
+                        # Load module
                         if dummy_state is None:
                             dummy_state = torch.zeros(backup_shape, dtype = backup_dtype, device = x_device)
                         else:
                             backup_shape = dummy_state.shape
                             backup_dtype = dummy_state.dtype
 
-                        # Load module
                         defer = module.can_defer_load()
                         if defer:
                             config.stc.begin_deferred_load()
@@ -173,45 +184,34 @@ class Model_LSMixin(ABC):
                                 for _ in range(max_output_factor - 1)
                             ]
 
-                        # Dereference extra dummy tensors
+                        # Cleanup
                         extra_dummy_out_states = None
                         qcache_overhead = None
-
-                        # We're good
-                        fail = False
                         progress.update(idx + 1)
+                        break  # SUCCESS
 
-                    # We're not good
                     except Exception as e:
                         config.stc.abort_deferred_load()
+                        # IF USING DEVICE MAP: ABORT EVERYTHING IMMEDIATELY
+                        if device_map is not None:
+                            log_msg = f"Equal autosplit: FATAL ERROR loading module {idx} ({module.get_name()}) on GPU {load_device}: {str(e)}"
+                            print(f"\n{log_msg}\n", flush=True)
+                            raise RuntimeError(log_msg) from e
+
+                        # ORIGINAL AUTOSPLIT LOGIC: Try next device
                         if e.__class__.__name__ == "OutOfMemoryError" or \
                             "CUDA out of memory" in str(e) or \
                             "HIP out of memory" in str(e):
-                            # Exception object will hold references to tensors so we can't free them here
-                            fail = True
+                            
+                            module.unload()
+                            dummy_state = None
+                            free_mem()
+                            current_device_i += 1
+                            if current_device_i >= len(active_devices):
+                                raise RuntimeError("Insufficient VRAM in split for model and cache")
+                            continue
                         else:
                             raise
-
-                    # Module failed to load with an OoM error, so advance to the next device if possible
-                    if fail:
-                        module.unload()
-                        dummy_state = None
-                        if "recurrent_states" in params:
-                            rls = [m for m in module if m.caps.get("recurrent_cache")]
-                            for rl in rls:
-                                for instance in self.get_layer_instances(rl.layer_idx):
-                                    s = params["recurrent_states"].get(instance)
-                                    if s:
-                                        s.reset()
-
-                        free_mem()
-                        current_device_i += 1
-                        if current_device_i >= len(active_devices):
-                            raise RuntimeError("Insufficient VRAM in split for model and cache")
-                        continue
-
-                    # On to next module
-                    break
 
             if callback_sync: callback_sync(len(modules), len(modules))
             if generator: yield len(modules), len(modules)
