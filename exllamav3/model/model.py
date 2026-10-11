@@ -372,6 +372,7 @@ class Model(Model_TPMixin, Model_LSMixin):
         max_chunk_size: int = 2048,
         max_output_size: int = 32,
         max_output_factor: int = 1,
+        overhead_mb: int | list[int] | None = None,
     ) -> int:
         """
         Largest cache size, in tokens (a multiple of the page size, at most cache.max_num_tokens), that
@@ -384,7 +385,7 @@ class Model(Model_TPMixin, Model_LSMixin):
         from .model_equal_split import max_context
         tokens, info = max_context(
             self, cache, proportions, margin_mb,
-            max_chunk_size, max_output_size, max_output_factor,
+            max_chunk_size, max_output_size, max_output_factor, overhead_mb,
         )
         print(f" -- Equal autosplit: max context {tokens:,} tokens with margins "
               f"{[m // 1024**2 for m in info['margin']]} MiB "
@@ -421,7 +422,8 @@ class Model(Model_TPMixin, Model_LSMixin):
         else:
             margin = margin_bytes(margin_mb, plan["proportions"], plan["devices"])
         lines = stress_test(
-            self, cache, plan["devices"], margin, max_chunk_size, max_q_len, plan["kv_per_token"], extra_params
+            self, cache, plan["devices"], margin, max_chunk_size, max_q_len, plan["kv_per_token"], extra_params,
+            plan.get("stage_per_token", 0),
         )
         for line in lines:
             print(line, flush = True)
@@ -542,6 +544,7 @@ class Model(Model_TPMixin, Model_LSMixin):
         autosplit_no_forward: bool = False,
         equal_split_proportions: list[float] | None = None,
         equal_split_margin_mb: int | list[int] = 1024,
+        equal_split_overhead_mb: int | list[int] | None = None,
     ):
         """
         Load model, generator function. For regular function, call load() with the same arguments
@@ -647,6 +650,12 @@ class Model(Model_TPMixin, Model_LSMixin):
             (default 1024 MB). One number applies to every device; a list gives one value per GPU, indexed
             like equal_split_proportions. Covers allocator fragmentation and what runs outside the model's forward
             (generator buffers, draft model passes, sampling).
+
+        :param equal_split_overhead_mb:
+            Runtime overhead charged to every device that receives layers with the equal split, on top of the
+            estimate (default None = model_equal_split.DEFAULT_OVERHEAD_MB, 192 MB): per-module buffers and
+            allocator rounding after load, kernel images and workspaces after warmup. One number or one per GPU.
+            Pass the same value to equal_split_max_context().
         """
 
         # The pass is there to hand back VRAM held by garbage from an earlier model. With nothing
@@ -733,6 +742,7 @@ class Model(Model_TPMixin, Model_LSMixin):
                             max_chunk_size = max_chunk_size,
                             max_output_size = max_output_size,
                             max_output_factor = max_output_factor,
+                            overhead_mb = equal_split_overhead_mb,
                         )
                         for line in plan_report(equal_plan):
                             print(line, flush = True)
@@ -768,7 +778,8 @@ class Model(Model_TPMixin, Model_LSMixin):
                             {oom_dev: equal_plan["margin"][equal_plan["devices"].index(oom_dev)]
                              if oom_dev in equal_plan["devices"] else max(equal_plan["margin"])},
                             equal_plan["kv_per_token"],
-                            len(equal_plan["devices"]), plan_report(equal_plan)
+                            len(equal_plan["devices"]), plan_report(equal_plan),
+                            equal_plan.get("stage_per_token", 0),
                         ) from e
                     self.output_device = self.modules[-1].device
 

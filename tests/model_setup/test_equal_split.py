@@ -196,6 +196,44 @@ def test_suggested_context():
     assert e0.suggested_context(4096) == 3840
 
 
+def test_suggested_context_counts_the_staging_scratch():
+    # Rig case (Qwen3.6-27B, cache 8,8, 7 GPUs): 146 MiB short on the worst GPU at 214,528 tokens. Every
+    # GPU sheds K/V/7 per token plus the whole 4 KiB/token fp16 staging of its attention layers, so the
+    # drop is ~16k tokens; counting the K/V share alone asked for twice that (183,552)
+    kv = 36 * 1024
+    e = es.EqualSplitHeadroomError("x", {2: 146 * MiB}, kv_bytes_per_token = kv, num_devices = 7,
+                                   stage_bytes_per_token = 4096)
+    per_token = kv / 7 + 4096
+    drop = 214528 - e.suggested_context(214528)
+    assert drop % 256 == 0
+    assert drop * per_token >= 146 * MiB > (drop - 256) * per_token
+    e_kv_only = es.EqualSplitHeadroomError("x", {2: 146 * MiB}, kv_bytes_per_token = kv, num_devices = 7)
+    assert 214528 - e_kv_only.suggested_context(214528) > 1.7 * drop
+
+
+def test_overhead_bytes_default_number_or_list():
+    assert es.overhead_bytes(None, [1, 1], [0, 1]) == [es.DEFAULT_OVERHEAD_MB * MiB] * 2
+    assert es.overhead_bytes(0, [1, 1, 1], [0, 2]) == [0, 0]
+    assert es.overhead_bytes([10, 20, 30], [1, 0, 1], [0, 2]) == [10 * MiB, 30 * MiB]
+    with pytest.raises(AssertionError):
+        es.overhead_bytes([10], [1, 1], [0, 1])
+
+
+def test_overhead_lowers_the_context_by_its_cost():
+    # The overhead comes off every device's budget, so max context drops by ~overhead / per-device K/V
+    n = 6
+    fixed = [400 * MiB] * 60
+    kv_tok = [600.0] * 60          # 36,000 B/token over 60 layers
+    peaks = [200 * MiB] * 60
+    usable = [7600 * MiB] * n
+    t0, _ = es.max_context_tokens(fixed, kv_tok, peaks, usable, 0, 1 << 20)
+    ov = 192 * MiB
+    t1, _ = es.max_context_tokens(fixed, kv_tok, peaks, [u - ov for u in usable], 0, 1 << 20)
+    assert t1 < t0
+    per_dev = sum(kv_tok) / n
+    assert abs((t0 - t1) - ov / per_dev) <= 2 * 256
+
+
 def test_margin_bytes_number_or_list():
     # One number applies to every active device; a list is indexed by GPU like the proportions
     assert es.margin_bytes(1024, [1, 1, 0, 1], [0, 1, 3]) == [1024 * MiB] * 3

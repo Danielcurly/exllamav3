@@ -12,6 +12,13 @@ safety margin, so an over-tight split fails at load time rather than on the firs
 The margin is set per device (one value for all, or one per GPU). The planner subtracts it from what each
 device can give, so the objective below maximizes the VRAM left over beyond every device's own margin.
 
+On top of the estimate, every device that receives layers is charged a runtime overhead (DEFAULT_OVERHEAD_MB,
+also one value or one per GPU): resident memory the metadata does not show (per-module buffers created at load,
+allocator rounding) and driver memory taken by warmup and the first forwards (kernel images, cuBLAS
+workspaces, graph pools). Calibrated on Qwen3.6-27B over 7 GPUs: ~170 MiB allocated beyond the estimate per
+device after load, ~80 MiB more of driver memory after warmup, while the peak estimate runs ~130 MiB high.
+Without it the first automatic context comes out a few percent too large and the load has to be retried.
+
 Objective ("water-filling"): find the largest margin M such that the layers, kept in order and split into
 contiguous runs, fit on the devices with
 
@@ -32,6 +39,9 @@ from ..constants import PAGE_SIZE
 
 MiB = 1024 ** 2
 
+# Runtime overhead charged to every device that holds layers (see module docstring)
+DEFAULT_OVERHEAD_MB = 192
+
 
 class EqualSplitHeadroomError(RuntimeError):
     """
@@ -40,9 +50,11 @@ class EqualSplitHeadroomError(RuntimeError):
     deficit: {device: bytes missing to reach the margin}
     kv_bytes_per_token: total K/V cache bytes per token of context over all devices (0 if unknown), so a
         caller can work out how much context to drop: freeing x tokens raises the equalized margin by
-        about x * kv_bytes_per_token / num_devices
+        about x * (kv_bytes_per_token / num_devices + stage_bytes_per_token)
     num_devices: devices in the split
     report: lines of the per-device table
+    stage_bytes_per_token: prefill staging scratch of a quantized cache per token of context, on every
+        device holding a cache layer (it scales with the whole cache, not with the device's share of it)
     """
 
     def __init__(
@@ -52,22 +64,25 @@ class EqualSplitHeadroomError(RuntimeError):
         kv_bytes_per_token: int = 0,
         num_devices: int = 1,
         report: list[str] | None = None,
+        stage_bytes_per_token: float = 0,
     ):
         super().__init__(message)
         self.deficit = deficit
         self.kv_bytes_per_token = kv_bytes_per_token
         self.num_devices = num_devices
         self.report = report or []
+        self.stage_bytes_per_token = stage_bytes_per_token
 
     def suggested_context(self, current: int, granularity: int = PAGE_SIZE) -> int:
         """
         Context length that should clear the largest deficit, rounded down to the granularity
         (at least one step below the current length)
         """
-        if not self.kv_bytes_per_token:
+        per_token = self.kv_bytes_per_token / max(1, self.num_devices) + self.stage_bytes_per_token
+        if per_token <= 0:
             return current - granularity
-        need = max(self.deficit.values(), default = 0) * self.num_devices
-        drop = -(-need // self.kv_bytes_per_token)
+        need = max(self.deficit.values(), default = 0)
+        drop = int(-(-need // per_token))
         drop = -(-drop // granularity) * granularity
         return max(granularity, current - max(drop, granularity))
 
@@ -216,6 +231,17 @@ def margin_bytes(margin_mb, proportions: list[float], devices: list[int]) -> lis
     assert len(margin_mb) >= len(proportions), \
         f"equal_split_margin_mb lists {len(margin_mb)} values, needs one per GPU ({len(proportions)})"
     return [int(margin_mb[i] * MiB) for i in devices]
+
+
+def overhead_bytes(overhead_mb, proportions: list[float], devices: list[int]) -> list[int]:
+    """Runtime overhead in bytes for each active device; None = DEFAULT_OVERHEAD_MB, otherwise like margin_mb"""
+    if overhead_mb is None:
+        overhead_mb = DEFAULT_OVERHEAD_MB
+    if isinstance(overhead_mb, (int, float)):
+        return [int(overhead_mb * MiB)] * len(devices)
+    overhead_mb = list(overhead_mb)
+    assert len(overhead_mb) >= len(proportions),         f"equal_split_overhead_mb lists {len(overhead_mb)} values, needs one per GPU ({len(proportions)})"
+    return [int(overhead_mb[i] * MiB) for i in devices]
 
 
 def usable_bytes(free: list[int], total: list[int], proportions: list[float]) -> list[int]:
@@ -427,17 +453,19 @@ def compute_equal_device_map(
     max_chunk_size: int,
     max_output_size: int,
     max_output_factor: int,
+    overhead_mb = None,
 ) -> tuple[dict[int, int | str], dict]:
     """
-    Plan the split. margin_mb: one number for every device or one per GPU. Returns
-    (device_map {module_idx: device | 'cpu'}, plan). Raises EqualSplitHeadroomError when no split leaves
-    every device its margin.
+    Plan the split. margin_mb, overhead_mb: one number for every device or one per GPU (overhead_mb None =
+    DEFAULT_OVERHEAD_MB). Returns (device_map {module_idx: device | 'cpu'}, plan). Raises
+    EqualSplitHeadroomError when no split leaves every device its margin.
     """
     devices = _active(proportions)
     margin = margin_bytes(margin_mb, proportions, devices)
+    overhead = overhead_bytes(overhead_mb, proportions, devices)
     free, total = device_state(devices)
     usable = usable_bytes(free, total, [proportions[i] for i in devices])
-    budget = [u - m for u, m in zip(usable, margin)]
+    budget = [u - m - o for u, m, o in zip(usable, margin, overhead)]
     baseline = [torch.cuda.memory_allocated(i) for i in devices]
 
     groups = collect_groups(model, max_chunk_size, max_output_size, max_output_factor)
@@ -463,9 +491,14 @@ def compute_equal_device_map(
         est_peak[d] = max(est_peak[d], _group_peak(g))
         num_groups[d] += 1
         kv_dev[d] += g["kv"]
+    # The runtime overhead is part of what a device holding layers keeps resident
+    for d in range(n):
+        if num_groups[d]:
+            est_static[d] += overhead[d]
 
     cache = _attached_cache(model)
     kv_per_token = sum(g["kv"] for g in gpu_groups) // cache.max_num_tokens if cache else 0
+    stage_per_token = max((g["stage"] for g in gpu_groups), default = 0) / cache.max_num_tokens         if cache else 0
 
     plan = {
         "devices": devices,
@@ -477,8 +510,10 @@ def compute_equal_device_map(
         "est_peak": est_peak,
         "num_groups": num_groups,
         "kv_per_token": kv_per_token,
+        "stage_per_token": stage_per_token,
         "context": cache.max_num_tokens if cache else 0,
         "margin": margin,
+        "overhead": overhead,
         "achieved": achieved,
     }
 
@@ -489,7 +524,7 @@ def compute_equal_device_map(
         raise EqualSplitHeadroomError(
             f"Equal autosplit: no split leaves every GPU its margin "
             f"(best: {-achieved // MiB} MiB short on the fullest)\n" + "\n".join(report),
-            deficit, kv_per_token, n, report
+            deficit, kv_per_token, n, report, stage_per_token
         )
     return device_map, plan
 
@@ -497,7 +532,8 @@ def compute_equal_device_map(
 def plan_report(plan: dict) -> list[str]:
     lines = [
         f" -- Equal autosplit plan: context {plan['context']:,} tokens, "
-        f"spare beyond each GPU's margin {plan['achieved'] // MiB} MiB (fullest GPU)",
+        f"spare beyond each GPU's margin {plan['achieved'] // MiB} MiB (fullest GPU), "
+        f"static includes {max(plan['overhead'], default = 0) // MiB} MiB runtime overhead per GPU",
         f"    {'GPU':>5}{'layers':>8}{'static':>10}{'peak':>10}{'usable':>10}{'free':>10}{'margin':>10}   (MiB)",
     ]
     for d, i in enumerate(plan["devices"]):
@@ -523,6 +559,7 @@ def max_context(
     max_chunk_size: int,
     max_output_size: int,
     max_output_factor: int,
+    overhead_mb = None,
 ) -> tuple[int, dict]:
     """
     Largest cache size (multiple of the page size, at most the size of the given cache) that the equal
@@ -532,9 +569,10 @@ def max_context(
     """
     devices = _active(proportions)
     margin = margin_bytes(margin_mb, proportions, devices)
+    overhead = overhead_bytes(overhead_mb, proportions, devices)
     free, total = device_state(devices)
     usable = usable_bytes(free, total, [proportions[i] for i in devices])
-    budget = [u - m for u, m in zip(usable, margin)]
+    budget = [u - m - o for u, m, o in zip(usable, margin, overhead)]
     groups = [g for g in collect_groups(model, max_chunk_size, max_output_size, max_output_factor)
               if not g["cpu"]]
     n0 = cache.max_num_tokens
@@ -552,6 +590,7 @@ def max_context(
         "devices": devices,
         "usable": usable,
         "margin": margin,
+        "overhead": overhead,
         "kv_per_token": sum(g["kv"] for g in groups) // n0,
         "achieved": achieved,
     }
@@ -589,7 +628,7 @@ def check_after_load(model, plan: dict, max_transient: dict[int, int]) -> list[s
             "Equal autosplit: after loading, GPU(s) " + ", ".join(str(i) for i in deficit) +
             " have less than their margin left beyond their largest measured transient\n" +
             "\n".join(lines),
-            deficit, plan["kv_per_token"], len(plan["devices"]), lines
+            deficit, plan["kv_per_token"], len(plan["devices"]), lines, plan.get("stage_per_token", 0)
         )
     return lines
 
@@ -604,6 +643,7 @@ def stress_test(
     max_q_len: int = 1,
     kv_per_token: int = 0,
     extra_params: dict | None = None,
+    stage_per_token: float = 0,
 ) -> list[str]:
     """
     Worst-case forward at the far end of the cache: a full chunk of prompt ending max_q_len tokens before
@@ -688,6 +728,6 @@ def stress_test(
         raise EqualSplitHeadroomError(
             "Equal autosplit: stress test at the end of the cache left GPU(s) " +
             ", ".join(str(i) for i in deficit) + " below their margin\n" + "\n".join(lines),
-            deficit, kv_per_token, len(devices), lines
+            deficit, kv_per_token, len(devices), lines, stage_per_token
         )
     return lines
