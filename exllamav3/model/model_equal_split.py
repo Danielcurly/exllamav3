@@ -160,17 +160,20 @@ def max_context_tokens(
     margin: int,
     max_tokens: int,
     granularity: int = PAGE_SIZE,
+    attn_peaks: list[int] | None = None,
+    stage_per_token: list[float] | None = None,
 ) -> tuple[int, int]:
     """
     Largest context (a multiple of granularity, at most max_tokens) whose split still leaves margin bytes
     free on every device. The K/V cache grows linearly with the context, so group statics are
-    fixed + kv_per_token * tokens. Returns (tokens, margin achieved at that size); tokens is 0 if not even
-    one granularity step fits.
+    fixed + kv_per_token * tokens. So does the prefill staging scratch of a quantized cache: a group's
+    peak is max(peak, attn_peak + stage_per_token * tokens). Returns (tokens, margin achieved at that
+    size); tokens is 0 if not even one granularity step fits.
     """
     def margin_at(steps):
         t = steps * granularity
         statics = [int(f + k * t) for f, k in zip(fixed_statics, kv_per_token)]
-        return plan_split(statics, peaks, usable)[1]
+        return plan_split(statics, peaks_at(peaks, attn_peaks, stage_per_token, t), usable)[1]
 
     lo, hi = 0, max_tokens // granularity
     if margin_at(hi) >= margin:
@@ -184,6 +187,22 @@ def max_context_tokens(
     if lo == 0:
         return 0, margin_at(1)
     return lo * granularity, margin_at(lo)
+
+
+def peaks_at(
+    peaks: list[int],
+    attn_peaks: list[int] | None,
+    stage_per_token: list[float] | None,
+    tokens: int,
+) -> list[int]:
+    """
+    Group peaks at a context length: the attention module of a quantized cache stages the referenced
+    window as fp16 K/V for prefill, a transient that grows with the cache
+    """
+    if not attn_peaks or not stage_per_token:
+        return list(peaks)
+    return [max(p, int(a + st * tokens)) if st else p
+            for p, a, st in zip(peaks, attn_peaks, stage_per_token)]
 
 
 def margin_bytes(margin_mb, proportions: list[float], devices: list[int]) -> list[int]:
@@ -281,7 +300,9 @@ def collect_groups(
     Group the model's modules by layer, in model order, with per group:
       fixed: weights + recurrent state (bytes, independent of the context length)
       kv: K/V cache bytes at the size of the attached cache
-      peak: largest transient of the group's modules
+      peak: largest transient of the group's modules, without the staging scratch
+      attn_peak, stage: transient of the module holding a quantized cache and its prefill staging
+        scratch (fp16 K + V for the whole cache, at the size of the attached cache); added on top
       cpu: group stays in system RAM
       indices: module indices
     """
@@ -320,14 +341,17 @@ def collect_groups(
         gid = _group_id(m.key)
         g = by_id.get(gid)
         if g is None:
-            g = {"id": gid, "fixed": 0, "kv": 0, "peak": 0, "cpu": bool(m.caps.get("prefer_cpu")), "indices": []}
+            g = {"id": gid, "fixed": 0, "kv": 0, "peak": 0, "attn_peak": 0, "stage": 0,
+                 "cpu": bool(m.caps.get("prefer_cpu")), "indices": []}
             by_id[gid] = g
             groups.append(g)
         g["indices"].append(idx)
         g["fixed"] += weights[idx]
+        stage = 0
         for sub in m:
             for cl in getattr(sub, "cache_layers", []):
                 g["kv"] += int(cl.storage_size())
+                stage = max(stage, _staging_bytes(cl))
             for rl in getattr(sub, "recurrent_layers", []):
                 g["fixed"] += int(rl.storage_size())
         if g["cpu"]:
@@ -341,8 +365,32 @@ def collect_groups(
             peak = _module_overhead(m, tokens)
         # Hidden state in and out of the module
         peak += 2 * tokens * hidden_size * 2
+        if stage:
+            g["attn_peak"] = max(g["attn_peak"], peak)
+            g["stage"] = max(g["stage"], stage)
         g["peak"] = max(g["peak"], peak)
     return groups
+
+
+def _staging_bytes(cache_layer) -> int:
+    """
+    Prefill staging scratch of a quantized cache layer: with EXL3_QC_STAGING >= 1 (the default), a prefill
+    dequantizes the referenced window into fp16 K and V buffers sized for the whole cache (bsz 1)
+    """
+    if type(cache_layer).__name__ != "CacheLayer_quant" or getattr(cache_layer, "shape", None) is None:
+        return 0
+    from ..modules.attention_fn.triton_paged import _qc_staging
+    if _qc_staging < 1:
+        return 0
+    numel = 1
+    for x in cache_layer.shape:
+        numel *= x
+    return 2 * numel * 2
+
+
+def _group_peak(g: dict) -> int:
+    """Peak of a group at the size of the attached cache"""
+    return max(g["peak"], g["attn_peak"] + g["stage"]) if g["stage"] else g["peak"]
 
 
 def device_state(devices: list[int]) -> tuple[list[int], list[int]]:
@@ -395,7 +443,7 @@ def compute_equal_device_map(
     groups = collect_groups(model, max_chunk_size, max_output_size, max_output_factor)
     gpu_groups = [g for g in groups if not g["cpu"]]
     statics = [g["fixed"] + g["kv"] for g in gpu_groups]
-    peaks = [g["peak"] for g in gpu_groups]
+    peaks = [_group_peak(g) for g in gpu_groups]
     assignment, achieved = plan_split(statics, peaks, budget)
 
     device_map = {}
@@ -412,7 +460,7 @@ def compute_equal_device_map(
         for idx in g["indices"]:
             device_map[idx] = devices[d]
         est_static[d] += s
-        est_peak[d] = max(est_peak[d], g["peak"])
+        est_peak[d] = max(est_peak[d], _group_peak(g))
         num_groups[d] += 1
         kv_dev[d] += g["kv"]
 
@@ -497,6 +545,8 @@ def max_context(
         budget,
         0,
         n0,
+        attn_peaks = [g["attn_peak"] for g in groups],
+        stage_per_token = [g["stage"] / n0 for g in groups],
     )
     info = {
         "devices": devices,

@@ -137,6 +137,37 @@ def test_max_context_is_the_largest_fitting_size():
         assert margin_at(tokens + 256) < margin
 
 
+def test_max_context_counts_the_staging_scratch():
+    # Quantized cache: every full-attention layer's prefill stages the whole cache as fp16 K/V
+    # (4 KiB/token here), a transient that grows with the context like the cache itself
+    fixed = [350 * MiB] * 64
+    kv = [0 if i % 4 else 34 * 1024 for i in range(64)]
+    peaks = [386 * MiB] * 64
+    attn = [0 if i % 4 else 386 * MiB for i in range(64)]
+    stage = [0 if i % 4 else 4096 for i in range(64)]
+    usable = [3300 * MiB] + [7600 * MiB] * 6
+    margin = 1024 * MiB
+    plain, _ = es.max_context_tokens(fixed, kv, peaks, usable, margin, 262144)
+    tokens, achieved = es.max_context_tokens(fixed, kv, peaks, usable, margin, 262144,
+                                             attn_peaks = attn, stage_per_token = stage)
+    assert tokens < plain
+    assert achieved >= margin
+
+    def margin_at(t):
+        return es.plan_split([int(f + k * t) for f, k in zip(fixed, kv)],
+                             es.peaks_at(peaks, attn, stage, t), usable)[1]
+
+    assert margin_at(tokens) >= margin
+    if tokens < 262144:
+        assert margin_at(tokens + 256) < margin
+
+
+def test_peaks_at():
+    assert es.peaks_at([10, 10], None, None, 1000) == [10, 10]
+    assert es.peaks_at([10, 10], [5, 0], [0.01, 0], 1000) == [15, 10]
+    assert es.peaks_at([10, 10], [5, 0], [0.001, 0], 1000) == [10, 10]
+
+
 def test_max_context_capped_and_zero():
     tokens, _ = es.max_context_tokens([MiB], [1.0], [0], [8000 * MiB], 0, 4096)
     assert tokens == 4096
