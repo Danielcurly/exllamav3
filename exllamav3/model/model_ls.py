@@ -84,6 +84,7 @@ class Model_LSMixin(ABC):
         max_batch_size: int,
         cache_weakrefs: dict,
         autosplit_no_forward: bool,
+        device_map: dict[int, int | str] | None = None,
     ):
         current_device_i = 0
         backup_shape, backup_dtype = self.default_load_shape_dtype(max_chunk_size)
@@ -150,14 +151,22 @@ class Model_LSMixin(ABC):
 
                 while True:
                     try:
-                        # Select device
-                        load_device = torch.device("cpu") if module.caps.get("prefer_cpu") else \
-                            torch.device(active_devices[current_device_i])
-                        x_device = torch.device("cpu") if module.caps.get("prefer_cpu") or module.caps.get("x_cpu") else \
-                            torch.device(active_devices[current_device_i])
+                        # Select device: forced by the equal split map, else sequential fill
+                        if device_map is not None and idx in device_map:
+                            assigned_dev = device_map[idx]
+                            load_device = torch.device(assigned_dev)
+                            if assigned_dev in active_devices:
+                                current_device_i = active_devices.index(assigned_dev)
+                            x_device = torch.device("cpu") if module.caps.get("prefer_cpu") or module.caps.get("x_cpu") else \
+                                load_device
+                        else:
+                            load_device = torch.device("cpu") if module.caps.get("prefer_cpu") else \
+                                torch.device(active_devices[current_device_i])
+                            x_device = torch.device("cpu") if module.caps.get("prefer_cpu") or module.caps.get("x_cpu") else \
+                                torch.device(active_devices[current_device_i])
 
-                        # Set VRAM limit if new device
-                        if load_device != torch.device("cpu") and load_device != prev_load_device:
+                        # Set VRAM limit if new device. The equal split map is enforced as is
+                        if device_map is None and load_device != torch.device("cpu") and load_device != prev_load_device:
                             prev_load_device = load_device
                             i = active_devices[current_device_i]
                             touched_devices.append(i)
@@ -229,6 +238,9 @@ class Model_LSMixin(ABC):
                                           f"measuring forward (budgeted as transient too)" + (f": {tags}" if tags else ""))
 
                                 max_transient[i] = max(max_transient.get(i, 0), transient)
+                            # Headroom checks only steer the sequential fill; the equal split map
+                            # already budgets each module's peak
+                            if measure and device_map is None:
                                 # Models with mixed layer type and dramatically different transient memory requirements
                                 # per layer break the assumption that if layer n fits and subsequently layer n+1 also
                                 # fits, then layer n will continue to work even with the weights of layer n+1 loaded
@@ -277,6 +289,11 @@ class Model_LSMixin(ABC):
                     # We're not good
                     except Exception as e:
                         config.stc.abort_deferred_load()
+                        # The equal split map leaves no device to fall back to
+                        if device_map is not None:
+                            msg = f"Equal autosplit: failed to load module {idx} ({module.key}) on {load_device}: {e}"
+                            print(f"\n{msg}\n", flush = True)
+                            raise RuntimeError(msg) from e
                         if e.__class__.__name__ == "OutOfMemoryError" or \
                             "CUDA out of memory" in str(e) or \
                             "HIP out of memory" in str(e):

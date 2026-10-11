@@ -475,6 +475,7 @@ class Model(Model_TPMixin, Model_LSMixin):
         max_batch_size: int = 1,
         tp_options: dict | None = None,
         autosplit_no_forward: bool = False,
+        equal_split_proportions: list[int] | None = None,
     ):
         """
         Load model, generator function. For regular function, call load() with the same arguments
@@ -564,6 +565,13 @@ class Model(Model_TPMixin, Model_LSMixin):
 
         :param autosplit_no_forward:
             For debug purposes, skip reference forward pass during autosplit load.
+
+        :param equal_split_proportions:
+            (optional, layer split only) Relative share of the model (weights + cache + peak working memory)
+            to place on each device, e.g. [1, 1, 1, 1] for an even split over four GPUs or [3, 1] to put three
+            quarters on cuda:0. A proportion of 0 excludes the device. The layer-to-device map is computed up
+            front and enforced: no sequential fill, no per-device memory fraction, and an OoM is fatal instead
+            of spilling to the next device. The cache must be constructed before calling load().
         """
 
         # The pass is there to hand back VRAM held by garbage from an earlier model. With nothing
@@ -586,6 +594,8 @@ class Model(Model_TPMixin, Model_LSMixin):
 
             assert not (bool(reserve_per_device) and bool(use_per_device)), \
                 "Cannot specify both memory usage and memory reserve."
+            assert equal_split_proportions is None or (device is None and not tensor_p), \
+                "equal_split_proportions only applies to layer-split loading."
 
             assert max_chunk_size >= 1, "max_chunk_size must be positive"
             assert max_output_size >= 1, "max_output_size must be positive"
@@ -636,6 +646,31 @@ class Model(Model_TPMixin, Model_LSMixin):
 
                 # Split load
                 if not tensor_p:
+                    # Equal split: compute the layer-to-device map up front from the given proportions
+                    device_map = None
+                    if equal_split_proportions is not None:
+                        from .model_equal_split import compute_equal_device_map
+
+                        # The cache must be constructed before load; retrieve it from the weakrefs
+                        cache = None
+                        cl = [m for m in self if m.caps.get("kv_cache")]
+                        if cl and len(cl[0].cache_layers) > 0:
+                            c0 = cl[0].cache_layers[0]
+                            cache = self.cache_weakrefs[c0.cache_id]()
+
+                        device_map, report = compute_equal_device_map(
+                            model = self,
+                            cache = cache,
+                            proportions = equal_split_proportions,
+                            max_chunk_size = max_chunk_size,
+                            max_output_size = max_output_size,
+                            max_output_factor = max_output_factor,
+                        )
+                        print("=== Equal Autosplit ===", flush = True)
+                        for line in report:
+                            print(line, flush = True)
+                        active_devices = [i for i, p in enumerate(equal_split_proportions) if p > 0]
+
                     yield from self._load_autosplit(
                         progressbar,
                         reserve_per_device,
@@ -652,6 +687,7 @@ class Model(Model_TPMixin, Model_LSMixin):
                         max_batch_size,
                         self.cache_weakrefs,
                         autosplit_no_forward,
+                        device_map,
                     )
                     self.output_device = self.modules[-1].device
 
