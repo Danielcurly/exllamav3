@@ -9,6 +9,9 @@ transient of every device), and an optional stress test runs a worst-case forwar
 cache. Both checks fail with EqualSplitHeadroomError when a device ends up with less free VRAM than the
 safety margin, so an over-tight split fails at load time rather than on the first long request.
 
+The margin is set per device (one value for all, or one per GPU). The planner subtracts it from what each
+device can give, so the objective below maximizes the VRAM left over beyond every device's own margin.
+
 Objective ("water-filling"): find the largest margin M such that the layers, kept in order and split into
 contiguous runs, fit on the devices with
 
@@ -181,6 +184,19 @@ def max_context_tokens(
     if lo == 0:
         return 0, margin_at(1)
     return lo * granularity, margin_at(lo)
+
+
+def margin_bytes(margin_mb, proportions: list[float], devices: list[int]) -> list[int]:
+    """
+    Safety margin in bytes for each active device. margin_mb is one number (MB, applies to every device)
+    or a list indexed by GPU like the proportions (one value per GPU).
+    """
+    if isinstance(margin_mb, (int, float)):
+        return [int(margin_mb * MiB)] * len(devices)
+    margin_mb = list(margin_mb)
+    assert len(margin_mb) >= len(proportions), \
+        f"equal_split_margin_mb lists {len(margin_mb)} values, needs one per GPU ({len(proportions)})"
+    return [int(margin_mb[i] * MiB) for i in devices]
 
 
 def usable_bytes(free: list[int], total: list[int], proportions: list[float]) -> list[int]:
@@ -359,25 +375,28 @@ def _active(proportions: list[float]) -> list[int]:
 def compute_equal_device_map(
     model,
     proportions: list[float],
-    margin: int,
+    margin_mb,
     max_chunk_size: int,
     max_output_size: int,
     max_output_factor: int,
 ) -> tuple[dict[int, int | str], dict]:
     """
-    Plan the split. Returns (device_map {module_idx: device | 'cpu'}, plan). Raises
-    EqualSplitHeadroomError when no split leaves margin bytes free on every device.
+    Plan the split. margin_mb: one number for every device or one per GPU. Returns
+    (device_map {module_idx: device | 'cpu'}, plan). Raises EqualSplitHeadroomError when no split leaves
+    every device its margin.
     """
     devices = _active(proportions)
+    margin = margin_bytes(margin_mb, proportions, devices)
     free, total = device_state(devices)
     usable = usable_bytes(free, total, [proportions[i] for i in devices])
+    budget = [u - m for u, m in zip(usable, margin)]
     baseline = [torch.cuda.memory_allocated(i) for i in devices]
 
     groups = collect_groups(model, max_chunk_size, max_output_size, max_output_factor)
     gpu_groups = [g for g in groups if not g["cpu"]]
     statics = [g["fixed"] + g["kv"] for g in gpu_groups]
     peaks = [g["peak"] for g in gpu_groups]
-    assignment, achieved = plan_split(statics, peaks, usable)
+    assignment, achieved = plan_split(statics, peaks, budget)
 
     device_map = {}
     for g in groups:
@@ -402,6 +421,7 @@ def compute_equal_device_map(
 
     plan = {
         "devices": devices,
+        "proportions": list(proportions),
         "total": total,
         "usable": usable,
         "baseline_allocated": baseline,
@@ -415,12 +435,12 @@ def compute_equal_device_map(
     }
 
     report = plan_report(plan)
-    if achieved < margin:
-        deficit = {devices[d]: margin - (usable[d] - est_static[d] - est_peak[d])
-                   for d in range(n) if usable[d] - est_static[d] - est_peak[d] < margin}
+    if achieved < 0:
+        deficit = {devices[d]: margin[d] - (usable[d] - est_static[d] - est_peak[d])
+                   for d in range(n) if usable[d] - est_static[d] - est_peak[d] < margin[d]}
         raise EqualSplitHeadroomError(
-            f"Equal autosplit: no split leaves {margin // MiB} MiB free on every GPU "
-            f"(best: {achieved // MiB} MiB)\n" + "\n".join(report),
+            f"Equal autosplit: no split leaves every GPU its margin "
+            f"(best: {-achieved // MiB} MiB short on the fullest)\n" + "\n".join(report),
             deficit, kv_per_token, n, report
         )
     return device_map, plan
@@ -429,13 +449,13 @@ def compute_equal_device_map(
 def plan_report(plan: dict) -> list[str]:
     lines = [
         f" -- Equal autosplit plan: context {plan['context']:,} tokens, "
-        f"margin target {plan['margin'] // MiB} MiB, equalized margin {plan['achieved'] // MiB} MiB",
-        f"    {'GPU':>5}{'layers':>8}{'static':>10}{'peak':>10}{'usable':>10}{'free':>10}   (MiB)",
+        f"spare beyond each GPU's margin {plan['achieved'] // MiB} MiB (fullest GPU)",
+        f"    {'GPU':>5}{'layers':>8}{'static':>10}{'peak':>10}{'usable':>10}{'free':>10}{'margin':>10}   (MiB)",
     ]
     for d, i in enumerate(plan["devices"]):
         s, p, u = plan["est_static"][d], plan["est_peak"][d], plan["usable"][d]
         lines.append(f"    {i:>5}{plan['num_groups'][d]:>8}{s // MiB:>10,}{p // MiB:>10,}{u // MiB:>10,}"
-                     f"{(u - s - p) // MiB:>10,}")
+                     f"{(u - s - p) // MiB:>10,}{plan['margin'][d] // MiB:>10,}")
     return lines
 
 
@@ -451,20 +471,22 @@ def max_context(
     model,
     cache,
     proportions: list[float],
-    margin: int,
+    margin_mb,
     max_chunk_size: int,
     max_output_size: int,
     max_output_factor: int,
 ) -> tuple[int, dict]:
     """
     Largest cache size (multiple of the page size, at most the size of the given cache) that the equal
-    split can place while leaving margin bytes free on every GPU. Call before loading the model, with the
+    split can place while leaving every GPU its margin (margin_mb: one number or one per GPU). Call before loading the model, with the
     draft model (if any) already loaded so its VRAM is accounted. The cache's K/V storage scales linearly
     with its size; the attached cache only provides the per-token cost.
     """
     devices = _active(proportions)
+    margin = margin_bytes(margin_mb, proportions, devices)
     free, total = device_state(devices)
     usable = usable_bytes(free, total, [proportions[i] for i in devices])
+    budget = [u - m for u, m in zip(usable, margin)]
     groups = [g for g in collect_groups(model, max_chunk_size, max_output_size, max_output_factor)
               if not g["cpu"]]
     n0 = cache.max_num_tokens
@@ -472,13 +494,14 @@ def max_context(
         [g["fixed"] for g in groups],
         [g["kv"] / n0 for g in groups],
         [g["peak"] for g in groups],
-        usable,
-        margin,
+        budget,
+        0,
         n0,
     )
     info = {
         "devices": devices,
         "usable": usable,
+        "margin": margin,
         "kv_per_token": sum(g["kv"] for g in groups) // n0,
         "achieved": achieved,
     }
@@ -494,8 +517,8 @@ def check_after_load(model, plan: dict, max_transient: dict[int, int]) -> list[s
     from ..util.memory import device_mem_info
     margin = plan["margin"]
     lines = [
-        f" -- Equal autosplit after load (MiB): estimated vs measured, margin target {margin // MiB} MiB",
-        f"    {'GPU':>5}{'est.static':>12}{'loaded':>10}{'est.peak':>10}{'meas.peak':>11}{'headroom':>10}",
+        f" -- Equal autosplit after load (MiB): estimated vs measured",
+        f"    {'GPU':>5}{'est.static':>12}{'loaded':>10}{'est.peak':>10}{'meas.peak':>11}{'headroom':>10}{'margin':>9}",
     ]
     deficit = {}
     for d, i in enumerate(plan["devices"]):
@@ -505,15 +528,16 @@ def check_after_load(model, plan: dict, max_transient: dict[int, int]) -> list[s
         transient = max_transient.get(i, 0)
         headroom = reusable - transient
         loaded = alloc - plan["baseline_allocated"][d]
-        flag = "" if headroom >= margin else "  << below margin"
+        flag = "" if headroom >= margin[d] else "  << below margin"
         lines.append(f"    {i:>5}{plan['est_static'][d] // MiB:>12,}{loaded // MiB:>10,}"
-                     f"{plan['est_peak'][d] // MiB:>10,}{transient // MiB:>11,}{headroom // MiB:>10,}{flag}")
-        if headroom < margin:
-            deficit[i] = margin - headroom
+                     f"{plan['est_peak'][d] // MiB:>10,}{transient // MiB:>11,}{headroom // MiB:>10,}"
+                     f"{margin[d] // MiB:>9,}{flag}")
+        if headroom < margin[d]:
+            deficit[i] = margin[d] - headroom
     if deficit:
         raise EqualSplitHeadroomError(
             "Equal autosplit: after loading, GPU(s) " + ", ".join(str(i) for i in deficit) +
-            f" have less than {margin // MiB} MiB left beyond their largest measured transient\n" +
+            " have less than their margin left beyond their largest measured transient\n" +
             "\n".join(lines),
             deficit, plan["kv_per_token"], len(plan["devices"]), lines
         )
@@ -525,7 +549,7 @@ def stress_test(
     model,
     cache,
     devices: list[int],
-    margin: int,
+    margin: list[int],
     max_chunk_size: int,
     max_q_len: int = 1,
     kv_per_token: int = 0,
@@ -593,27 +617,27 @@ def stress_test(
 
     lines = [
         f" -- Equal autosplit stress test: {chunk} prompt tokens at {p1:,} + {q} token step at "
-        f"{p1 + chunk:,} (cache {cap:,}), margin target {margin // MiB} MiB",
-        f"    {'GPU':>5}{'peak':>10}{'headroom':>10}   (MiB)",
+        f"{p1 + chunk:,} (cache {cap:,})",
+        f"    {'GPU':>5}{'peak':>10}{'headroom':>10}{'margin':>9}   (MiB)",
     ]
     deficit = {}
-    for i in devices:
+    for d, i in enumerate(devices):
         peak = max(0, torch.cuda.max_memory_allocated(i) - before[i])
         free, _ = device_mem_info(i)
         headroom = free + torch.cuda.memory_reserved(i) - torch.cuda.memory_allocated(i) - peak
         if oom is not None:
             headroom = min(headroom, 0)
-        flag = "" if headroom >= margin else "  << below margin"
-        lines.append(f"    {i:>5}{peak // MiB:>10,}{headroom // MiB:>10,}{flag}")
-        if headroom < margin:
-            deficit[i] = margin - headroom
+        flag = "" if headroom >= margin[d] else "  << below margin"
+        lines.append(f"    {i:>5}{peak // MiB:>10,}{headroom // MiB:>10,}{margin[d] // MiB:>9,}{flag}")
+        if headroom < margin[d]:
+            deficit[i] = margin[d] - headroom
     if oom is not None:
         lines.append(f"    out of memory: {str(oom).splitlines()[0][:200]}")
     free_mem()
     if deficit:
         raise EqualSplitHeadroomError(
             "Equal autosplit: stress test at the end of the cache left GPU(s) " +
-            ", ".join(str(i) for i in deficit) + f" below the {margin // MiB} MiB margin\n" + "\n".join(lines),
+            ", ".join(str(i) for i in deficit) + " below their margin\n" + "\n".join(lines),
             deficit, kv_per_token, len(devices), lines
         )
     return lines

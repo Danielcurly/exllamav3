@@ -163,3 +163,47 @@ def test_suggested_context():
     assert e.suggested_context(262144) % 256 == 0
     e0 = es.EqualSplitHeadroomError("x", {0: 1}, kv_bytes_per_token = 0, num_devices = 8)
     assert e0.suggested_context(4096) == 3840
+
+
+def test_margin_bytes_number_or_list():
+    # One number applies to every active device; a list is indexed by GPU like the proportions
+    assert es.margin_bytes(1024, [1, 1, 0, 1], [0, 1, 3]) == [1024 * MiB] * 3
+    assert es.margin_bytes(512.5, [1, 1], [0, 1]) == [int(512.5 * MiB)] * 2
+    assert es.margin_bytes([100, 200, 300, 400], [1, 1, 0, 1], [0, 1, 3]) == [100 * MiB, 200 * MiB, 400 * MiB]
+    with pytest.raises(AssertionError):
+        es.margin_bytes([100, 200], [1, 1, 1], [0, 1, 2])
+
+
+def test_per_device_margin_shifts_layers_off_the_device_with_the_larger_margin():
+    # Same usable VRAM everywhere; GPU 1 asks for 2 GiB more margin, so it must end up with about 2 GiB
+    # more free VRAM than the others (within one layer), and every device keeps at least its margin
+    rng = random.Random(7)
+    statics = [rng.randint(300, 420) * MiB for _ in range(40)]
+    peaks = [rng.randint(20, 160) * MiB for _ in range(40)]
+    usable = [7600 * MiB] * 4
+    margin = [512 * MiB, 2560 * MiB, 512 * MiB, 512 * MiB]
+    budget = [u - m for u, m in zip(usable, margin)]
+    assignment, spare = es.plan_split(statics, peaks, budget)
+    free = _margins(assignment, statics, peaks, usable)
+    assert spare >= 0
+    for d, f in free.items():
+        assert f >= margin[d]
+    others = [f for d, f in free.items() if d != 1]
+    assert free[1] - min(others) >= 2048 * MiB - 420 * MiB
+    # Exact on a size brute force can check: no contiguous split leaves more spare beyond the margins
+    small = slice(0, 10)
+    _, spare_small = es.plan_split(statics[small], peaks[small], budget)
+    assert spare_small == _brute_force(statics[small], peaks[small], budget)
+
+
+def test_per_device_margin_max_context():
+    fixed = [350 * MiB] * 32
+    kv = [64 * 1024 / 16] * 32
+    peaks = [100 * MiB] * 32
+    usable = [7600 * MiB] * 4
+    margin = [1024 * MiB, 1024 * MiB, 3072 * MiB, 1024 * MiB]
+    budget = [u - m for u, m in zip(usable, margin)]
+    tokens, spare = es.max_context_tokens(fixed, kv, peaks, budget, 0, 1 << 20)
+    tokens_even, _ = es.max_context_tokens(fixed, kv, peaks, [u - 1024 * MiB for u in usable], 0, 1 << 20)
+    assert spare >= 0
+    assert 0 < tokens < tokens_even

@@ -368,26 +368,28 @@ class Model(Model_TPMixin, Model_LSMixin):
         self,
         cache,
         proportions: list[float],
-        margin_mb: int = 1024,
+        margin_mb: int | list[int] = 1024,
         max_chunk_size: int = 2048,
         max_output_size: int = 32,
         max_output_factor: int = 1,
     ) -> int:
         """
         Largest cache size, in tokens (a multiple of the page size, at most cache.max_num_tokens), that
-        load(equal_split_proportions = proportions) can place while every device keeps margin_mb free.
+        load(equal_split_proportions = proportions) can place while every device keeps margin_mb free
+        (one number for every device, or a list with one value per GPU).
         Call before loading this model and after loading anything else that shares the devices (a draft
         model), then build the cache with the returned size. Pure estimate: the load checks it against the
         measured memory and equal_split_stress_test() against a worst-case forward.
         """
         from .model_equal_split import max_context
         tokens, info = max_context(
-            self, cache, proportions, int(margin_mb) * 1024**2,
+            self, cache, proportions, margin_mb,
             max_chunk_size, max_output_size, max_output_factor,
         )
-        print(f" -- Equal autosplit: max context {tokens:,} tokens with a {margin_mb} MiB margin "
+        print(f" -- Equal autosplit: max context {tokens:,} tokens with margins "
+              f"{[m // 1024**2 for m in info['margin']]} MiB "
               f"(K/V {info['kv_per_token'] / 1024:.1f} KiB/token, "
-              f"equalized margin {info['achieved'] // 1024**2} MiB)", flush = True)
+              f"spare beyond margin {info['achieved'] // 1024**2} MiB)", flush = True)
         return tokens
 
 
@@ -396,7 +398,7 @@ class Model(Model_TPMixin, Model_LSMixin):
         cache = None,
         max_chunk_size: int = 2048,
         max_q_len: int = 1,
-        margin_mb: int | None = None,
+        margin_mb: int | list[int] | None = None,
         extra_params: dict | None = None,
     ) -> list[str]:
         """
@@ -405,7 +407,7 @@ class Model(Model_TPMixin, Model_LSMixin):
         Raises model_equal_split.EqualSplitHeadroomError otherwise. Like warmup(), run it before a generator
         attaches to the cache. extra_params go into every forward (a draft model's draft_verifier_params).
         """
-        from .model_equal_split import stress_test
+        from .model_equal_split import stress_test, margin_bytes
         plan = getattr(self, "equal_split_plan", None)
         assert plan is not None, "equal_split_stress_test() needs a model loaded with equal_split_proportions"
         if cache is None:
@@ -414,7 +416,10 @@ class Model(Model_TPMixin, Model_LSMixin):
                 if cache is not None:
                     break
         assert cache is not None, "No cache attached to the model"
-        margin = plan["margin"] if margin_mb is None else int(margin_mb) * 1024**2
+        if margin_mb is None:
+            margin = plan["margin"]
+        else:
+            margin = margin_bytes(margin_mb, plan["proportions"], plan["devices"])
         lines = stress_test(
             self, cache, plan["devices"], margin, max_chunk_size, max_q_len, plan["kv_per_token"], extra_params
         )
@@ -536,7 +541,7 @@ class Model(Model_TPMixin, Model_LSMixin):
         tp_options: dict | None = None,
         autosplit_no_forward: bool = False,
         equal_split_proportions: list[float] | None = None,
-        equal_split_margin_mb: int = 1024,
+        equal_split_margin_mb: int | list[int] = 1024,
     ):
         """
         Load model, generator function. For regular function, call load() with the same arguments
@@ -639,7 +644,8 @@ class Model(Model_TPMixin, Model_LSMixin):
 
         :param equal_split_margin_mb:
             Free VRAM every device must keep beyond its largest measured transient with the equal split
-            (default 1024 MB): covers allocator fragmentation and what runs outside the model's forward
+            (default 1024 MB). One number applies to every device; a list gives one value per GPU, indexed
+            like equal_split_proportions. Covers allocator fragmentation and what runs outside the model's forward
             (generator buffers, draft model passes, sampling).
         """
 
@@ -723,7 +729,7 @@ class Model(Model_TPMixin, Model_LSMixin):
                         device_map, equal_plan = compute_equal_device_map(
                             model = self,
                             proportions = equal_split_proportions,
-                            margin = int(equal_split_margin_mb) * 1024**2,
+                            margin_mb = equal_split_margin_mb,
                             max_chunk_size = max_chunk_size,
                             max_output_size = max_output_size,
                             max_output_factor = max_output_factor,
@@ -758,7 +764,10 @@ class Model(Model_TPMixin, Model_LSMixin):
                             raise
                         from .model_equal_split import EqualSplitHeadroomError
                         raise EqualSplitHeadroomError(
-                            str(e), {oom_dev: equal_plan["margin"]}, equal_plan["kv_per_token"],
+                            str(e),
+                            {oom_dev: equal_plan["margin"][equal_plan["devices"].index(oom_dev)]
+                             if oom_dev in equal_plan["devices"] else max(equal_plan["margin"])},
+                            equal_plan["kv_per_token"],
                             len(equal_plan["devices"]), plan_report(equal_plan)
                         ) from e
                     self.output_device = self.modules[-1].device
