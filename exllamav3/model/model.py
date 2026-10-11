@@ -364,6 +364,65 @@ class Model(Model_TPMixin, Model_LSMixin):
         return failures
 
 
+    def equal_split_max_context(
+        self,
+        cache,
+        proportions: list[float],
+        margin_mb: int = 1024,
+        max_chunk_size: int = 2048,
+        max_output_size: int = 32,
+        max_output_factor: int = 1,
+    ) -> int:
+        """
+        Largest cache size, in tokens (a multiple of the page size, at most cache.max_num_tokens), that
+        load(equal_split_proportions = proportions) can place while every device keeps margin_mb free.
+        Call before loading this model and after loading anything else that shares the devices (a draft
+        model), then build the cache with the returned size. Pure estimate: the load checks it against the
+        measured memory and equal_split_stress_test() against a worst-case forward.
+        """
+        from .model_equal_split import max_context
+        tokens, info = max_context(
+            self, cache, proportions, int(margin_mb) * 1024**2,
+            max_chunk_size, max_output_size, max_output_factor,
+        )
+        print(f" -- Equal autosplit: max context {tokens:,} tokens with a {margin_mb} MiB margin "
+              f"(K/V {info['kv_per_token'] / 1024:.1f} KiB/token, "
+              f"equalized margin {info['achieved'] // 1024**2} MiB)", flush = True)
+        return tokens
+
+
+    def equal_split_stress_test(
+        self,
+        cache = None,
+        max_chunk_size: int = 2048,
+        max_q_len: int = 1,
+        margin_mb: int | None = None,
+        extra_params: dict | None = None,
+    ) -> list[str]:
+        """
+        After load(equal_split_proportions = ...): run a full prompt chunk and a max_q_len-token step at the
+        end of the cache and require margin_mb (default: the load's margin) to remain free on every device.
+        Raises model_equal_split.EqualSplitHeadroomError otherwise. Like warmup(), run it before a generator
+        attaches to the cache. extra_params go into every forward (a draft model's draft_verifier_params).
+        """
+        from .model_equal_split import stress_test
+        plan = getattr(self, "equal_split_plan", None)
+        assert plan is not None, "equal_split_stress_test() needs a model loaded with equal_split_proportions"
+        if cache is None:
+            for ref in self.cache_weakrefs.values():
+                cache = ref()
+                if cache is not None:
+                    break
+        assert cache is not None, "No cache attached to the model"
+        margin = plan["margin"] if margin_mb is None else int(margin_mb) * 1024**2
+        lines = stress_test(
+            self, cache, plan["devices"], margin, max_chunk_size, max_q_len, plan["kv_per_token"], extra_params
+        )
+        for line in lines:
+            print(line, flush = True)
+        return lines
+
+
     @torch.inference_mode
     def prefill(self, input_ids: torch.Tensor, params: dict | None = None):
         """
@@ -442,6 +501,7 @@ class Model(Model_TPMixin, Model_LSMixin):
 
 
     def unload(self):
+        self.equal_split_plan = None
         for module in self.modules:
             module.unload()
         # The loader's open slab blocks must not outlive the tensors sliced from them
@@ -475,7 +535,8 @@ class Model(Model_TPMixin, Model_LSMixin):
         max_batch_size: int = 1,
         tp_options: dict | None = None,
         autosplit_no_forward: bool = False,
-        equal_split_proportions: list[int] | None = None,
+        equal_split_proportions: list[float] | None = None,
+        equal_split_margin_mb: int = 1024,
     ):
         """
         Load model, generator function. For regular function, call load() with the same arguments
@@ -567,11 +628,19 @@ class Model(Model_TPMixin, Model_LSMixin):
             For debug purposes, skip reference forward pass during autosplit load.
 
         :param equal_split_proportions:
-            (optional, layer split only) Relative share of the model (weights + cache + peak working memory)
-            to place on each device, e.g. [1, 1, 1, 1] for an even split over four GPUs or [3, 1] to put three
-            quarters on cuda:0. A proportion of 0 excludes the device. The layer-to-device map is computed up
-            front and enforced: no sequential fill, no per-device memory fraction, and an OoM is fatal instead
-            of spilling to the next device. The cache must be constructed before calling load().
+            (optional, layer split only) Place the layers so that every listed device keeps the same amount of
+            free VRAM, counting weights, cache, recurrent state and each layer's peak working memory, plus
+            whatever the device already holds (CUDA context, a draft model loaded before). One value per
+            device, relative to the largest: the largest may use all free VRAM, a device at half of it at most
+            half of its total VRAM, 0 excludes the device ([1] * 8 = even margin on eight GPUs). The map is
+            computed up front and enforced (no sequential fill, a failed module load is fatal), then checked
+            against the memory measured during loading. Construct the cache before calling load().
+            Raises model_equal_split.EqualSplitHeadroomError when a device would keep less than the margin.
+
+        :param equal_split_margin_mb:
+            Free VRAM every device must keep beyond its largest measured transient with the equal split
+            (default 1024 MB): covers allocator fragmentation and what runs outside the model's forward
+            (generator buffers, draft model passes, sampling).
         """
 
         # The pass is there to hand back VRAM held by garbage from an earlier model. With nothing
@@ -646,50 +715,61 @@ class Model(Model_TPMixin, Model_LSMixin):
 
                 # Split load
                 if not tensor_p:
-                    # Equal split: compute the layer-to-device map up front from the given proportions
+                    # Equal split: plan the layer-to-device map up front
                     device_map = None
+                    equal_plan = None
                     if equal_split_proportions is not None:
-                        from .model_equal_split import compute_equal_device_map
-
-                        # The cache must be constructed before load; retrieve it from the weakrefs
-                        cache = None
-                        cl = [m for m in self if m.caps.get("kv_cache")]
-                        if cl and len(cl[0].cache_layers) > 0:
-                            c0 = cl[0].cache_layers[0]
-                            cache = self.cache_weakrefs[c0.cache_id]()
-
-                        device_map, report = compute_equal_device_map(
+                        from .model_equal_split import compute_equal_device_map, plan_report
+                        device_map, equal_plan = compute_equal_device_map(
                             model = self,
-                            cache = cache,
                             proportions = equal_split_proportions,
+                            margin = int(equal_split_margin_mb) * 1024**2,
                             max_chunk_size = max_chunk_size,
                             max_output_size = max_output_size,
                             max_output_factor = max_output_factor,
                         )
-                        print("=== Equal Autosplit ===", flush = True)
-                        for line in report:
+                        for line in plan_report(equal_plan):
                             print(line, flush = True)
-                        active_devices = [i for i, p in enumerate(equal_split_proportions) if p > 0]
+                        active_devices = equal_plan["devices"]
 
-                    yield from self._load_autosplit(
-                        progressbar,
-                        reserve_per_device,
-                        use_per_device,
-                        active_devices,
-                        max_chunk_size,
-                        max_output_size,
-                        max_output_factor,
-                        callback,
-                        generator,
-                        self.config,
-                        self.modules,
-                        verbose,
-                        max_batch_size,
-                        self.cache_weakrefs,
-                        autosplit_no_forward,
-                        device_map,
-                    )
+                    try:
+                        yield from self._load_autosplit(
+                            progressbar,
+                            reserve_per_device,
+                            use_per_device,
+                            active_devices,
+                            max_chunk_size,
+                            max_output_size,
+                            max_output_factor,
+                            callback,
+                            generator,
+                            self.config,
+                            self.modules,
+                            verbose,
+                            max_batch_size,
+                            self.cache_weakrefs,
+                            autosplit_no_forward,
+                            device_map,
+                        )
+                    except RuntimeError as e:
+                        # An OoM while loading the planned split: report it like a failed headroom check
+                        oom_dev = getattr(e, "equal_split_oom_device", None)
+                        if oom_dev is None:
+                            raise
+                        from .model_equal_split import EqualSplitHeadroomError
+                        raise EqualSplitHeadroomError(
+                            str(e), {oom_dev: equal_plan["margin"]}, equal_plan["kv_per_token"],
+                            len(equal_plan["devices"]), plan_report(equal_plan)
+                        ) from e
                     self.output_device = self.modules[-1].device
+
+                    # Hold the plan to what loading measured
+                    if equal_plan is not None:
+                        from .model_equal_split import check_after_load
+                        free_mem()
+                        for line in check_after_load(self, equal_plan, self.autosplit_max_transient):
+                            print(line, flush = True)
+                        self.equal_split_plan = equal_plan
 
                 # Tensor-P load:
                 else:

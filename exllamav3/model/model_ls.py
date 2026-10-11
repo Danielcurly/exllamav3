@@ -91,6 +91,7 @@ class Model_LSMixin(ABC):
         dummy_state = None
         prev_load_device = None
         touched_devices = []
+        equal_devices = []
         params = self.default_load_params(max_chunk_size)
         # The measuring forwards below exist to observe VRAM allocation; modules with CPU-side
         # compute (CPU-offloaded experts) can skip the host work when they see this flag
@@ -152,13 +153,12 @@ class Model_LSMixin(ABC):
                 while True:
                     try:
                         # Select device: forced by the equal split map, else sequential fill
-                        if device_map is not None and idx in device_map:
-                            assigned_dev = device_map[idx]
-                            load_device = torch.device(assigned_dev)
-                            if assigned_dev in active_devices:
-                                current_device_i = active_devices.index(assigned_dev)
+                        if device_map is not None:
+                            load_device = torch.device(device_map[idx])
                             x_device = torch.device("cpu") if module.caps.get("prefer_cpu") or module.caps.get("x_cpu") else \
                                 load_device
+                            if load_device.type == "cuda" and load_device.index not in equal_devices:
+                                equal_devices.append(load_device.index)
                         else:
                             load_device = torch.device("cpu") if module.caps.get("prefer_cpu") else \
                                 torch.device(active_devices[current_device_i])
@@ -238,8 +238,8 @@ class Model_LSMixin(ABC):
                                           f"measuring forward (budgeted as transient too)" + (f": {tags}" if tags else ""))
 
                                 max_transient[i] = max(max_transient.get(i, 0), transient)
-                            # Headroom checks only steer the sequential fill; the equal split map
-                            # already budgets each module's peak
+                            # Headroom checks steer the sequential fill. The equal split map is fixed:
+                            # its headroom is checked against max_transient once everything is loaded
                             if measure and device_map is None:
                                 # Models with mixed layer type and dramatically different transient memory requirements
                                 # per layer break the assumption that if layer n fits and subsequently layer n+1 also
@@ -292,8 +292,10 @@ class Model_LSMixin(ABC):
                         # The equal split map leaves no device to fall back to
                         if device_map is not None:
                             msg = f"Equal autosplit: failed to load module {idx} ({module.key}) on {load_device}: {e}"
-                            print(f"\n{msg}\n", flush = True)
-                            raise RuntimeError(msg) from e
+                            err = RuntimeError(msg)
+                            if e.__class__.__name__ == "OutOfMemoryError" or "out of memory" in str(e):
+                                err.equal_split_oom_device = load_device.index
+                            raise err from e
                         if e.__class__.__name__ == "OutOfMemoryError" or \
                             "CUDA out of memory" in str(e) or \
                             "HIP out of memory" in str(e):
@@ -327,7 +329,7 @@ class Model_LSMixin(ABC):
             dummy_state = None
             unset_memory_fraction(touched_devices)
             if verbose:
-                for i in touched_devices:
+                for i in touched_devices + equal_devices:
                     print(f" -- autosplit: cuda:{i} largest measured transient {max_transient.get(i, 0) >> 20} MiB, "
                           f"{torch.cuda.mem_get_info(i)[0] >> 20} MiB free after load")
 
@@ -337,6 +339,8 @@ class Model_LSMixin(ABC):
 
         config.stc.close()
         self.active_devices = active_devices
+        # Largest transient measured per device, for the equal split's check after loading
+        self.autosplit_max_transient = max_transient
 
         # Python will not run anything in an async function without at least one yield statement
         if 'yield' in locals():
