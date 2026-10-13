@@ -5,6 +5,72 @@
 
 [Installation](#installation) · [Supported models](#architecture-support) · [Examples](#examples) · [Quantization](#exl3-quantization) · [Community](#community)
 
+> [!NOTE]
+> **This is a fork of [turboderp-org/exllamav3](https://github.com/turboderp-org/exllamav3)** that adds **equal autosplit**, a layer-split loader for multi-GPU rigs. Everything else is upstream ExLlamaV3 (currently based on v1.6.1). The branch with the feature is [`equal-autosplit-v1.6`](https://github.com/Danielcurly/exllamav3/tree/equal-autosplit-v1.6). The rest of this README is the upstream one.
+
+## Equal autosplit (this fork)
+
+The stock autosplit fills one GPU after another, leaving a fixed reserve on each. On a rig with many GPUs this has a few problems:
+
+- The first GPUs are packed to the limit and the last ones are left half empty, so free VRAM is unevenly spread.
+- The reserve has to cover the transient memory of the forward pass (attention and MLP scratch, the prefill staging of a quantized cache). Those peaks are not counted, so a split that loads fine can still run out of memory on the first long prompt.
+- You end up tuning `gpu_split`, the reserve and the context length by trial and error, and doing it again for every model.
+
+Equal autosplit works out the layer-to-GPU map before loading, so that **every GPU keeps the same amount of free VRAM**. Then it checks the map against what was actually allocated:
+
+- **Planned from metadata.** The plan counts tensor sizes from the safetensors index, the cache and recurrent state of each layer, the largest transient of each module, and whatever is already on each device (CUDA context, a draft model loaded first). A binary search over the margin ("water-filling") finds the contiguous split that leaves the most free VRAM on the fullest GPU.
+- **Per-GPU safety margin.** `equal_split_margin_mb` is one number for every GPU, or a list with one value per GPU. A runtime overhead (192 MiB by default, calibrated) covers buffers and driver memory that the metadata doesn't show.
+- **Proportions.** `equal_split_proportions` takes one weight per device, relative to the largest. Use `[1] * n` for an even split, a lower value for a GPU you want to keep partly free, and `0` to exclude a GPU.
+- **Automatic context.** `equal_split_max_context()` returns the largest cache that still fits with the margin on every GPU.
+- **Checked, not trusted.** After loading, the estimate is compared with measured memory. An optional stress test then runs a full prompt chunk and a decode step at the very end of the cache. If any GPU would drop below its margin, `EqualSplitHeadroomError` is raised, with the deficit per GPU and a suggested context. So a split that is too tight fails at load time, not in the middle of a request.
+
+### Usage
+
+```python
+from exllamav3 import Config, Model, Cache
+
+config = Config.from_directory(model_dir)
+model = Model.from_config(config)
+proportions = [1] * 8                                 # same free VRAM on 8 GPUs
+
+# Optional: find the largest context that fits, then build the real cache with it
+cache = Cache(model, max_num_tokens = 262144)         # upper bound
+context = model.equal_split_max_context(cache, proportions, margin_mb = 1024)
+cache.detach_from_model()
+cache = Cache(model, max_num_tokens = context)
+
+model.load(equal_split_proportions = proportions, equal_split_margin_mb = 1024)
+model.equal_split_stress_test(cache)                  # worst-case forward at the end of the cache
+```
+
+Construct the cache before calling `load()`. The feature applies to layer-split loading only (not tensor parallel).
+
+### Example: Qwen3.6-27B (8.0 bpw) on 7 GPUs, automatic context
+
+```
+ -- Equal autosplit: max context 244,224 tokens with margins [1024, 1024, 1024, 1024, 1024, 1024, 1024] MiB
+ -- Equal autosplit plan: context 244,224 tokens, spare beyond each GPU's margin 0 MiB (fullest GPU)
+      GPU  layers    static      peak    usable      free    margin   (MiB)
+        0       7     3,288     1,340     6,362     1,733     1,024
+        1       9     5,013     1,340     7,633     1,279     1,024
+        2      11     5,268     1,340     7,633     1,024     1,024
+        3       9     5,013     1,340     7,633     1,279     1,024
+        4      11     5,268     1,340     7,633     1,024     1,024
+        5       9     5,013     1,340     7,658     1,305     1,024
+        6      10     5,060     1,340     7,658     1,257     1,024
+ -- Equal autosplit stress test: 2048 prompt tokens at 242,171 + 5 token step at 244,219 (cache 244,224)
+      GPU      peak  headroom   margin   (MiB)
+        0     1,195     1,942    1,024
+        2     1,196     1,075    1,024
+        ...
+```
+
+GPU 0 gets fewer layers because the MTP draft model was loaded onto it first. Every GPU stays above its 1 GiB margin, even in the worst case at a context of 244k tokens. That context was computed by the loader, not tuned by hand.
+
+Tests: `pytest --noconftest tests/model_setup/test_equal_split.py`. The code is in [`exllamav3/model/model_equal_split.py`](exllamav3/model/model_equal_split.py).
+
+---
+
 ExLlamaV3 is an inference library for running local LLMs on modern consumer GPUs, with flexible quantization and parallel inference.
 
 - **Quantization** - [EXL3](#exl3-quantization), based on QTIP, plus 2–8 bit cache quantization.
