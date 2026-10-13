@@ -6,7 +6,7 @@
 [Installation](#installation) · [Supported models](#architecture-support) · [Examples](#examples) · [Quantization](#exl3-quantization) · [Community](#community)
 
 > [!NOTE]
-> **This is a fork of [turboderp-org/exllamav3](https://github.com/turboderp-org/exllamav3)** that adds **equal autosplit**, a layer-split loader for multi-GPU rigs. Everything else is upstream ExLlamaV3 (currently based on v1.6.1). The branch with the feature is [`equal-autosplit-v1.6`](https://github.com/Danielcurly/exllamav3/tree/equal-autosplit-v1.6). The rest of this README is the upstream one.
+> **This is a fork of [turboderp-org/exllamav3](https://github.com/turboderp-org/exllamav3)** that adds **equal autosplit**, a layer-split loader for multi-GPU rigs. Everything else is upstream ExLlamaV3 (currently based on v1.6.1). The branch with the feature is [`equal-autosplit-v1.6`](https://github.com/Danielcurly/exllamav3/tree/equal-autosplit-v1.6). TabbyAPI support: [Danielcurly/tabbyAPI](https://github.com/Danielcurly/tabbyAPI). The rest of this README is the upstream one.
 
 ## Equal autosplit (this fork)
 
@@ -44,6 +44,8 @@ model.equal_split_stress_test(cache)                  # worst-case forward at th
 ```
 
 Construct the cache before calling `load()`. The feature applies to layer-split loading only (not tensor parallel).
+
+**With TabbyAPI:** the fork [Danielcurly/tabbyAPI](https://github.com/Danielcurly/tabbyAPI) (branch `equal-autosplit`) exposes all of this as config options (`equal_split_proportions`, `equal_split_margin_mb`, automatic context with retry, stress test with the draft model).
 
 ### Example: Qwen3.6-27B (8.0 bpw) on 7 GPUs, automatic context
 
